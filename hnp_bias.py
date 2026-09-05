@@ -17,6 +17,16 @@ How bias happens in real code:
   * timestamp- or counter-derived nonces
 None of these produce a repeated r. All of them are fatal.
 
+Two shapes, and they need different handling. Leading-zero bias (a short
+value used directly, high bits zero) makes k itself small: k < 2^(256-L).
+Trailing-zero bias (a short read zero-padded on the low end, or a counter
+shifted left) makes k a multiple of 2^L with full-width top bits, so k is
+*not* small -- it is small only after dividing by 2^L. The lattice below is
+built for small k; it recovers the trailing-zero shape only after rescaling
+the public coefficients by 2^-L (mod n), which is what `low=True` does. Bias
+with an unknown or non-power-of-two structure is a different problem and this
+basis does not cover it.
+
 Reduction to the Hidden Number Problem
 --------------------------------------
 From s = k^-1 (z + r d):
@@ -109,22 +119,34 @@ def biased_nonce(bias_bits):
     return secrets.randbits(NBITS - bias_bits) or 1
 
 
+def biased_nonce_low(bias_bits):
+    """A nonce whose low `bias_bits` bits are zero: k = j << bias_bits with j
+    full-width. Stands in for a short read zero-padded on the low end, or a
+    counter shifted left. k is not small; k / 2^bias_bits is."""
+    return (secrets.randbits(NBITS - bias_bits) << bias_bits) or (1 << bias_bits)
+
+
 # ------------------------------------------------------------------- attack
 
-def build_lattice(sigs, hashes, K, center=True):
+def build_lattice(sigs, hashes, K, center=True, scale=1):
     """Rows of the HNP lattice, integer-scaled by n.
 
     `center` shifts each unknown nonce by -K/2 so it ranges over
     [-K/2, K/2) instead of [0, K). The vector we are hunting gets shorter by
     a factor of two, which is worth a full bit of bias -- measurably the
     difference between needing 60 signatures and 40 at an 8-bit bias.
+
+    `scale` multiplies the public coefficients t, u by a constant mod n. For
+    trailing-zero bias (k = j << L) pass scale = 2^-L mod n, which turns the
+    small unknown into j = k >> L; the recovered d is unchanged. Default 1
+    leaves the leading-zero case alone.
     """
     m = len(sigs)
     t, u = [], []
     for (r, s), z in zip(sigs, hashes):
         si = inv(s, N)
-        t.append(si * r % N)
-        u.append(si * z % N)
+        t.append(si * r % N * scale % N)
+        u.append(si * z % N * scale % N)
 
     if center:
         half = K // 2
@@ -146,48 +168,66 @@ def build_lattice(sigs, hashes, K, center=True):
 def extract_key(basis_rows, t, u, B, pub):
     """Scan every reduced basis vector for the private key.
 
-    Two independent extraction paths, each tried in both signs, each validated
-    against the public key. Cheap, and removes all guesswork about which row
-    LLL happened to put the target in.
+    Two independent extraction paths, each tried in both signs. A candidate d
+    is confirmed in two stages: recompute every nonce k_i = u_i + t_i*d and
+    reject unless all land in the centered bound [-B, B] -- m modular multiplies
+    that kill wrong candidates for the price of no elliptic-curve work -- then a
+    single point_mul on the survivor validates against the public key. Without
+    the filter this is one point_mul per candidate, up to 4(m+2) of them, which
+    dominates runtime at large m.
     """
     m = len(t)
+    inv_t0 = inv(t[0], N) if t[0] else None
+
+    def confirms(d):
+        d %= N
+        if not d:
+            return False
+        for ti, ui in zip(t, u):
+            ki = (ui + ti * d) % N
+            if B < ki < N - B:      # outside the centered band -> wrong d
+                return False
+        return point_mul(d) == pub
+
     for row in basis_rows:
-        v = list(row)
         for sign in (1, -1):
-            w = [sign * x for x in v]
+            w = [sign * x for x in row]
 
             # path A: the d-slot holds d*B directly
             if w[m] != 0 and w[m] % B == 0:
                 d = w[m] // B % N
-                if d and point_mul(d) == pub:
+                if confirms(d):
                     return d, "d-slot"
 
-            # path B: the first slot holds n*k'_0 (the centered nonce);
-            # invert the affine relation k' = u' + t*d.
-            if w[0] != 0 and w[0] % N == 0 and t[0]:
-                k0 = w[0] // N % N
-                d = (k0 - u[0]) * inv(t[0], N) % N
-                if d and point_mul(d) == pub:
+            # path B: column 0 is a multiple of n by construction, so w[0]//n
+            # is the centered nonce k'_0; invert k' = u' + t*d for d.
+            if w[0] != 0 and inv_t0 is not None:
+                k0 = w[0] // N
+                d = (k0 - u[0]) * inv_t0 % N
+                if confirms(d):
                     return d, "k-slot"
     return None, None
 
 
-def run_case(bias_bits, m, use_bkz=False, block=20, verbose=True):
+def run_case(bias_bits, m, use_bkz=False, block=20, verbose=True, low=False):
     d = secrets.randbelow(N - 1) + 1
     pub = point_mul(d)
     K = 1 << (NBITS - bias_bits)
 
     sigs, hashes = [], []
     for i in range(m):
-        msg = f"tx-{bias_bits}-{i}".encode()
-        k = biased_nonce(bias_bits)
+        msg = f"tx-{bias_bits}-{'lo' if low else 'hi'}-{i}".encode()
+        k = biased_nonce_low(bias_bits) if low else biased_nonce(bias_bits)
         sigs.append(sign_with_k(d, msg, k))
         hashes.append(h(msg))
 
     # sanity: no r collisions, so the easy attack is unavailable
     assert len(set(r for r, _ in sigs)) == m, "unexpected r collision"
 
-    rows, t, u, B = build_lattice(sigs, hashes, K)
+    # trailing-zero bias makes k = j << L; rescale by 2^-L so j is the small
+    # unknown. leading-zero bias leaves k small already (scale = 1).
+    scale = inv(1 << bias_bits, N) if low else 1
+    rows, t, u, B = build_lattice(sigs, hashes, K, scale=scale)
     M = IntegerMatrix.from_matrix(rows)
 
     t0 = time.time()
@@ -205,20 +245,22 @@ def run_case(bias_bits, m, use_bkz=False, block=20, verbose=True):
     if verbose:
         status = "RECOVERED" if ok else "failed"
         algo = f"BKZ-{block}" if use_bkz else "LLL"
-        print(f"  bias={bias_bits:>3} bits   m={m:>3} sigs   dim={m+2:>3}   "
+        shape = "low" if low else "high"
+        print(f"  bias={bias_bits:>3} bits ({shape})   m={m:>3} sigs   dim={m+2:>3}   "
               f"{algo:<7} {elapsed:6.2f}s   {status}"
               + (f"  [{path}]" if ok else ""))
     return ok, elapsed, d, found
 
 
-def run_trials(bias_bits, m, n_trials, use_bkz=False, block=20):
+def run_trials(bias_bits, m, n_trials, use_bkz=False, block=20, low=False):
     """Repeat run_case over independent signature sets. Lattice success is
     probabilistic in the draw, so a single run is one sample, not a threshold.
     Returns (successes, n_trials, mean_seconds)."""
     ok = 0
     total = 0.0
     for _ in range(n_trials):
-        success, elapsed, _, _ = run_case(bias_bits, m, use_bkz, block, verbose=False)
+        success, elapsed, _, _ = run_case(bias_bits, m, use_bkz, block,
+                                          verbose=False, low=low)
         ok += success
         total += elapsed
     return ok, n_trials, total / n_trials
@@ -257,6 +299,28 @@ def main():
     print(f"  recovered        {hx(found) if found else '(none)'}")
     print(f"  correct?         {found == d}   via {path}")
 
+    # ------------------------------------------ trailing-zero (low-bit) variant
+    print("\n[trailing-zero bias] k = j << L (a short read zero-padded low, or a")
+    print("counter shifted left). k is large, but k >> L is small. The small-k")
+    print("basis misses it; rescaling the coefficients by 2^-L (mod n) finds it.")
+    bias, m = 64, 8
+    d = secrets.randbelow(N - 1) + 1
+    pub = point_mul(d)
+    K = 1 << (NBITS - bias)
+    sigs, hashes = [], []
+    for i in range(m):
+        msg = f"low-demo-{i}".encode()
+        sigs.append(sign_with_k(d, msg, biased_nonce_low(bias)))
+        hashes.append(h(msg))
+    for label, scale in (("scale = 1   (small-k basis)", 1),
+                         ("scale = 2^-L (rescaled)", inv(1 << bias, N))):
+        rows, t, u, B = build_lattice(sigs, hashes, K, scale=scale)
+        M = IntegerMatrix.from_matrix(rows)
+        LLL.reduction(M)
+        reduced = [[M[i, j] for j in range(M.ncols)] for i in range(M.nrows)]
+        found, _ = extract_key(reduced, t, u, B, pub)
+        print(f"  {label:<28} {'RECOVERED' if found == d else 'failed'}")
+
     # ------------------------------------------------------ how far it goes
     print("\n" + "=" * 78)
     print("HOW LITTLE BIAS IS ENOUGH")
@@ -271,7 +335,6 @@ def main():
         (16, 30, False, 0),
         (8, 34, False, 0),
         (8, 40, False, 0),
-        (4, 120, True, 20),
     ]
     for bias, m, bkz, block in cases:
         try:
@@ -280,9 +343,17 @@ def main():
             print(f"  bias={bias:>3} bits   m={m:>3} sigs   error: {e}")
         sys.stdout.flush()
 
-    print("\n  Each row above is a single draw. Success is probabilistic in the")
-    print("  signature set, so one run near the boundary tells you little. The")
-    print("  sweep below measures the rate.")
+    # 4-bit is where LLL gives out and BKZ takes over, and it is the row
+    # closest to the reduction limit, so a single draw there is the most
+    # likely to be luck. Report a small rate instead.
+    ok, n, avg = run_trials(4, 120, 3, use_bkz=True, block=20)
+    print(f"  bias=  4 bits (high)   m=120 sigs   dim=122   BKZ-20   "
+          f"{ok}/{n} recovered   {avg:5.1f}s avg")
+    sys.stdout.flush()
+
+    print("\n  The LLL rows above are a single draw each. Success is probabilistic")
+    print("  in the signature set, so one run near the boundary tells you little.")
+    print("  The sweep below measures the rate.")
 
     # ------------------------------------------------- threshold, measured
     print("\n" + "=" * 78)
@@ -296,9 +367,11 @@ def main():
         bar = "#" * round(rate * 20)
         print(f"  m={m:>3}   {ok:>2}/{n}   {rate:5.0%}  {bar:<20}  {avg:5.2f}s avg")
         sys.stdout.flush()
-    print("\n  m=32 (the 256/8 floor) never solves; m=34 is ~55%, a coin flip;")
-    print("  it saturates by m=38. The lone m=34 fail in the single-draw table")
-    print("  above was one side of that coin, not a threshold at 40.")
+    print("\n  m=32 is exactly the 256/8 floor: 32*8 = 256 bits of leak against a")
+    print("  256-bit secret leaves the lattice no margin, so it is a hard 0, not")
+    print("  bad luck. m=34 is ~55%, a coin flip, and it saturates by m=38. The")
+    print("  lone m=34 fail in the single-draw table above was one side of that")
+    print("  coin, not a threshold at 40.")
 
     # ------------------------------------------------------- the defensive test
     print("\n" + "=" * 78)
@@ -338,6 +411,11 @@ def main():
         print(f"    {label:<20} max bitlen {max(lens):>3}   "
               f"mean {sum(lens)/len(lens):6.1f}   "
               f"(expected ~255.0 for uniform)")
+    print("\n  8-bit bias separates cleanly at 60 samples, but that is the easy")
+    print("  case. The count needed grows as the bias shrinks; at 1 to 2 bits, 60")
+    print("  samples will not separate biased from uniform, so this test catches")
+    print("  gross truncation only. The RFC 6979 determinism assertion above does")
+    print("  not depend on sample count and is the check to wire into CI.")
     print()
 
 

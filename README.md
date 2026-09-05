@@ -17,7 +17,7 @@ keys on repeated r never sees it, at any scale.
 ```
 python3 nonce_reuse.py
 python3 nonce_reuse_lows.py
-pip install fpylll cysignals && python3 hnp_bias.py   # last case takes ~25s
+pip install fpylll cysignals && python3 hnp_bias.py   # ~75s: 4-bit BKZ + the 8-bit sweep
 ```
 
 ## Low-s breaks the naive reuse formula half the time
@@ -44,31 +44,39 @@ detection rate on duplicate-r reuse.
 centered HNP basis, secp256k1:
 
 ```
-bias=128 bits   m=  4 sigs   LLL      0.00s   RECOVERED
-bias= 64 bits   m=  8 sigs   LLL      0.00s   RECOVERED
-bias= 32 bits   m= 14 sigs   LLL      0.01s   RECOVERED
-bias= 16 bits   m= 30 sigs   LLL      0.07s   RECOVERED
-bias=  8 bits   m= 34 sigs   LLL      0.09s   failed
-bias=  8 bits   m= 40 sigs   LLL      0.15s   RECOVERED
-bias=  4 bits   m=120 sigs   BKZ-20  22.04s   RECOVERED
+bias=128 bits (high)   m=  4 sigs   LLL      0.00s   RECOVERED
+bias= 64 bits (high)   m=  8 sigs   LLL      0.00s   RECOVERED
+bias= 32 bits (high)   m= 14 sigs   LLL      0.00s   RECOVERED
+bias= 16 bits (high)   m= 30 sigs   LLL      0.05s   RECOVERED
+bias=  8 bits (high)   m= 34 sigs   LLL      0.08s   failed
+bias=  8 bits (high)   m= 40 sigs   LLL      0.13s   RECOVERED
+bias=  4 bits (high)   m=120 sigs   BKZ-20   3/3 recovered   14.6s avg
 ```
 
-Each row above is a single draw, and lattice success is probabilistic in the
-signature set. Run 40 independent sets per m at 8-bit bias and the threshold is
-a band, not a cliff:
+The LLL rows are a single draw each; the 4-bit BKZ row is the one closest to
+the reduction limit, so it is a 3-set rate rather than one lucky draw. Lattice
+success is probabilistic in the signature set. Run 40 independent sets per m at
+8-bit bias and the threshold is a band, not a cliff:
 
 ```
 m=30    0/40     0%
-m=32    0/40     0%      <- the 256/8 theory floor; never solves
-m=34   22/40    55%      <- a coin flip
-m=36   36/40    90%
+m=32    0/40     0%      <- 32*8 = 256 bits of leak vs a 256-bit secret; no margin, a hard 0
+m=34   21/40    52%      <- a coin flip
+m=36   39/40    98%
 m=38   40/40   100%
 m=40   40/40   100%
 ```
 
-The lone m=34 failure in the single-draw table is one side of that 55% coin,
-not evidence of a threshold at 40. `run_trials()` in `hnp_bias.py` produces the
+The lone m=34 failure in the single-draw table is one side of that coin, not
+evidence of a threshold at 40. `run_trials()` in `hnp_bias.py` produces the
 sweep.
+
+Two bias shapes reach the same key. Leading-zero bias (a short value used
+directly) makes k itself small and the basis above finds it. Trailing-zero bias
+(a low-end zero-padded read, or a counter shifted left) makes k = j << L, which
+is large but small after dividing by 2^L, so the same basis finds it only once
+the public coefficients are rescaled by 2^-L mod n. `low=True` does that; with
+scale 1 the trailing-zero shape is invisible to the lattice.
 
 ## Reading
 
